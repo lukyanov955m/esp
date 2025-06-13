@@ -62,6 +62,9 @@ int pendingCount = 0;
 const char* usersFile = "/users.json";
 
 String currentVersion = "1.0";
+String previousVersion = "1.0";
+String rebootConfirmChat = "";
+unsigned long rebootRequestTime = 0;
 // переменные для добавления карты
 bool addCardMode = false;
 String pendingUID = "";
@@ -201,6 +204,10 @@ void sendToAllAdmins(String msg){
     bot->sendMessage(users[i].id,msg);
 }
 
+void notifyAdminsReboot(){
+  sendToAllAdmins("⚠️ Система была перезагружена (" + getCurrentTimeStr() + ")");
+}
+
 void requestAccess(String id, String name){
   if(findPendingIndex(id)!=-1) return;
   if(pendingCount<MAX_PENDING){
@@ -284,6 +291,18 @@ void sendAvailableCommands(String chat, String role){
   bot->sendMessage(chat,getHelpText(role));
 }
 
+void sendAdminStatusWithStats(String chat){
+  String msg="Статус:\n";
+  unsigned long up=millis()/1000;
+  msg += "Аптайм: " + String(up/3600) + " ч " + String((up%3600)/60) + " м";
+  msg += "\nВерсия: " + currentVersion;
+  msg += "\nПредыдущая версия: " + previousVersion;
+  if(WiFi.status()==WL_CONNECTED){
+    msg += "\nIP: " + WiFi.localIP().toString();
+  }
+  bot->sendMessage(chat,msg);
+}
+
 // ===== UDP discovery =====
 void broadcastHello(){
   if(millis()-lastHello>5000){
@@ -297,7 +316,18 @@ void listenHello(){
   int ps=udp.parsePacket();
   if(ps){
     char buf[32];
-    int len=udp.read(buf,sizeof(buf)-1); if(len>0){ buf[len]=0; if(String(buf)=="SECOND-HELLO") secondIP=udp.remoteIP(); }}
+    int len=udp.read(buf,sizeof(buf)-1);
+    if(len>0){
+      buf[len]=0;
+      if(String(buf)=="SECOND-HELLO"){
+        IPAddress newIp=udp.remoteIP();
+        if(newIp!=secondIP){
+          secondIP=newIp;
+          sendCards();
+        }
+      }
+    }
+  }
 }
 
 // ===== HTTP helpers =====
@@ -371,6 +401,13 @@ void handleTelegram(){
     int uidx = findUserIndex(fromId);
     String role = (uidx!=-1)?users[uidx].role:"user";
 
+    if(rebootConfirmChat==chat && millis()-rebootRequestTime<10000 && (text=="/reboot" || text=="Перезапуск")){
+      bot->sendMessage(chat,"Перезагрузка...");
+      notifyAdminsReboot();
+      delay(1000);
+      ESP.restart();
+    }
+
     // этап ввода имени и срока действия при добавлении карты
     if(addCardMode && chat==getAdmin()){
       if(pendingUID.length()>0 && pendingName==""){
@@ -409,7 +446,8 @@ void handleTelegram(){
     else if(text.startsWith("Удалить-") && role=="admin"){ String uid=text.substring(text.indexOf('-')+1); removeUserById(uid); bot->sendMessage(chat,"Пользователь удалён"); }
     else if(text=="/request" || text=="Запросить доступ"){ requestAccess(fromId,userName); }
     else if(text=="/help" || text=="Помощь"){ sendAvailableCommands(chat,role); }
-    else if(text=="/status" || text=="Статус"){ bot->sendMessage(chat,"Версия "+currentVersion); }
+    else if(text=="/status" || text=="Статус"){ if(role=="admin") sendAdminStatusWithStats(chat); else bot->sendMessage(chat,"Версия "+currentVersion); }
+    else if(text=="/reboot" || text=="Перезапуск"){ if(role=="admin"){ rebootConfirmChat=chat; rebootRequestTime=millis(); bot->sendMessage(chat,"Повторите команду ещё раз для подтверждения"); } }
     else sendAvailableCommands(chat,role);
   }
 }
@@ -430,6 +468,7 @@ void setup(){
   loadCards();
   loadUsers();
   ensureMainAdmin();
+  notifyAdminsReboot();
 }
 
 void loop(){
@@ -442,6 +481,9 @@ void loop(){
     lastExp = millis();
     removeExpiredCards();
     checkExpiredUsers();
+  }
+  if(rebootConfirmChat!="" && millis()-rebootRequestTime>10000){
+    rebootConfirmChat="";
   }
   delay(5);
 }
