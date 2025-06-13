@@ -1,4 +1,9 @@
 #include <ESP8266WiFi.h>
+// === Архитектура ===
+// Первая плата хранит список карт и общается с Telegram.
+// Через UDP она ищет вторую плату и запоминает её IP.
+// По HTTP отправляет ей команды открытия ворот и актуальные списки карт.
+// Вторая плата занимается реле и считывателем RFID.
 #include <WiFiUdp.h>
 #include <ESP8266HTTPClient.h>
 #include <FS.h>
@@ -9,6 +14,7 @@
 #include <ESP8266HTTPUpdateServer.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include "commands.h"
 
 #define EEPROM_SIZE 512
 #define WIFI_SSID_ADDR 0
@@ -26,6 +32,9 @@ UniversalTelegramBot* bot = nullptr;
 
 ESP8266WebServer apServer(80);
 ESP8266HTTPUpdateServer httpUpdater;
+const char* WEB_USER="admin";
+const char* WEB_PASS="1234";
+const char* AP_NAME="SetupESP8266"; // имя точки доступа
 
 #define MAX_CARDS 32
 #define MAX_USERS 8
@@ -33,26 +42,25 @@ ESP8266HTTPUpdateServer httpUpdater;
 
 // ===== Структуры =====
 struct User {
-  String id;             // ID пользователя в Telegram
-  String name;           // имя пользователя
-  String role;           // admin/guest/user
-  unsigned long expire;  // время окончания гостевого доступа
+  String id;             
+  String name;           
+  String role;           
+  unsigned long expire;  
 };
 struct Pending {
   String id;
   String name;
 };
 
-// Структура карты доступа
 struct Card {
-  int number;             // порядковый номер
-  String uid;             // UID карты
-  String name;            // имя владельца
-  unsigned long expire;   // время окончания действия, 0 - постоянно
-  bool isTemp;            // временная карта
+  int number;            
+  String uid;            
+  String name;           
+  unsigned long expire;  
+  bool isTemp;           
 };
 Card cards[MAX_CARDS];
-int cardCount = 0;        // количество карт в памяти
+int cardCount = 0;        
 const char* cardsFile = "/cards.json";
 
 User users[MAX_USERS];
@@ -69,6 +77,14 @@ unsigned long rebootRequestTime = 0;
 bool addCardMode = false;
 String pendingUID = "";
 String pendingName = "";
+
+// === Индикация состояния ===
+const int LED_PIN = LED_BUILTIN; 
+unsigned long ledTimer = 0;
+bool ledState = false;
+
+// ===== Флаг наличия сети =====
+bool networkReady = false;
 
 // ===== EEPROM helpers =====
 void getEEPROMString(int addr, char* dest, size_t maxLen, const char* def="") {
@@ -89,24 +105,61 @@ String getEEPROMString(int addr, size_t maxLen, const char* def="") {
 }
 void saveEEPROMString(int addr, const char* val, size_t maxLen) {
   EEPROM.begin(EEPROM_SIZE);
-  for(size_t i=0;i<maxLen;i++) EEPROM.write(addr+i, (i<strlen(val))?val[i]:0);
+  size_t len = strlen(val);
+  if(len > maxLen - 1) len = maxLen - 1;
+  for(size_t i=0;i<maxLen;i++)
+    EEPROM.write(addr+i, (i<len)?val[i]:0);
   EEPROM.commit();
   EEPROM.end();
 }
 String getSSID(){return getEEPROMString(WIFI_SSID_ADDR,64,"YOUR_SSID");}
 String getPass(){return getEEPROMString(WIFI_PASS_ADDR,64,"YOUR_PASSWORD");}
 String getToken(){return getEEPROMString(BOT_TOKEN_ADDR,128,"YOUR_BOT_TOKEN");}
-String getAdmin(){return getEEPROMString(ADMIN_ID_ADDR,32,"123456");}
+String getAdmin(){return getEEPROMString(ADMIN_ID_ADDR,32,"123456789");}
+
+Cmd parseCmd(const String &t){
+  if(t=="/open" || t=="Открыть ворота") return CMD_OPEN;
+  if(t=="/cardlist" || t=="Список карт") return CMD_CARDLIST;
+  if(t=="/addcard" || t=="Добавить карту" || t=="Добавитькарту") return CMD_ADD;
+  if(t=="/users" || t=="Пользователи") return CMD_USERS;
+  if(t=="/request" || t=="Запросить доступ") return CMD_REQUEST;
+  if(t=="/help" || t=="Помощь") return CMD_HELP;
+  if(t=="/status" || t=="Статус") return CMD_STATUS;
+  if(t=="/reboot" || t=="Перезапуск") return CMD_REBOOT;
+  if(t.startsWith("Удалитькарту-")) return CMD_DELETE_CARD;
+  if(t.startsWith("/grant-")) return CMD_GRANT;
+  if(t.startsWith("/reject-")) return CMD_REJECT;
+  if(t.startsWith("Удалить-")) return CMD_GRANT;
+  return CMD_NONE;
+}
 
 // ===== SPIFFS =====
 void loadCards(){
   cardCount=0;
-  if(!SPIFFS.exists(cardsFile)) return;
+  if(!SPIFFS.exists(cardsFile)) {
+    Serial.println("[SPIFFS] Файл карт не найден, создаю новый");
+    File nf = SPIFFS.open(cardsFile, "w");
+    if(nf){ nf.print("[]"); nf.close(); }
+    cardCount = 0;
+    return;
+  }
   File f=SPIFFS.open(cardsFile,"r");
-  if(!f) return;
+  if(!f){
+    Serial.println("[SPIFFS] Не удалось открыть файл карт");
+    return;
+  }
+  if(f.size()>2048){
+    Serial.println("[SPIFFS] Файл карт слишком большой");
+    f.close();
+    return;
+  }
   DynamicJsonDocument doc(2048);
   DeserializationError err=deserializeJson(doc,f);
-  if(err){f.close();return;}
+  if(err){
+    Serial.println("[SPIFFS] Ошибка разбора JSON карт");
+    f.close();
+    return;
+  }
   for(JsonObject obj: doc.as<JsonArray>()){
     if(cardCount>=MAX_CARDS) break;
     cards[cardCount].number = obj["number"].as<int>();
@@ -117,7 +170,7 @@ void loadCards(){
     cardCount++;}
   f.close();
 }
-void saveCards(){
+bool saveCards(){
   DynamicJsonDocument doc(2048);
   JsonArray arr=doc.to<JsonArray>();
   for(int i=0;i<cardCount;i++){
@@ -129,10 +182,18 @@ void saveCards(){
     o["isTemp"] = cards[i].isTemp;
   }
   File f=SPIFFS.open(cardsFile,"w");
-  if(f){serializeJson(doc,f);f.close();}
+  if(!f){
+    Serial.println("[SPIFFS] Не удалось открыть файл для записи карт");
+    return false;
+  }
+  if(serializeJson(doc,f)==0){
+    Serial.println("[SPIFFS] Ошибка записи файла карт");
+    f.close();
+    return false;
+  }
+  f.close();
+  return true;
 }
-
-// удаляем просроченные временные карты
 void removeExpiredCards(){
   unsigned long now = time(nullptr);
   bool changed = false;
@@ -170,13 +231,28 @@ void saveUsers(){
   File f=SPIFFS.open(usersFile,"w");
   if(f){serializeJson(doc,f);f.close();}
 }
-
 void loadUsers(){
   userCount=0;
-  if(!SPIFFS.exists(usersFile)) return;
-  File f=SPIFFS.open(usersFile,"r"); if(!f) return;
+  if(!SPIFFS.exists(usersFile)){
+    Serial.println("[SPIFFS] Файл пользователей не найден");
+    return;
+  }
+  File f=SPIFFS.open(usersFile,"r");
+  if(!f){
+    Serial.println("[SPIFFS] Не удалось открыть файл пользователей");
+    return;
+  }
+  if(f.size()>2048){
+    Serial.println("[SPIFFS] Файл пользователей слишком большой");
+    f.close();
+    return;
+  }
   DynamicJsonDocument doc(1024); DeserializationError err=deserializeJson(doc,f);
-  if(err){f.close(); return;}
+  if(err){
+    Serial.println("[SPIFFS] Ошибка разбора JSON пользователей");
+    f.close();
+    return;
+  }
   for(JsonObject o: doc.as<JsonArray>()){
     if(userCount>=MAX_USERS) break;
     users[userCount].id=o["id"].as<String>();
@@ -187,7 +263,6 @@ void loadUsers(){
   }
   f.close();
 }
-
 void ensureMainAdmin(){
   if(findUserIndex(getAdmin())==-1 && userCount<MAX_USERS){
     users[userCount].id=getAdmin();
@@ -198,17 +273,24 @@ void ensureMainAdmin(){
     saveUsers();
   }
 }
-
 void sendToAllAdmins(String msg){
+  if (!bot) return;
   for(int i=0;i<userCount;i++) if(users[i].role=="admin")
     bot->sendMessage(users[i].id,msg);
 }
-
 void notifyAdminsReboot(){
+  if (!bot) return;
   sendToAllAdmins("⚠️ Система была перезагружена (" + getCurrentTimeStr() + ")");
 }
-
+String getCurrentTimeStr(){
+  time_t now = time(nullptr);
+  struct tm* ti = localtime(&now);
+  char buf[24];
+  strftime(buf, sizeof(buf), "%d-%m-%Y %H:%M", ti);
+  return String(buf);
+}
 void requestAccess(String id, String name){
+  if (!bot) return;
   if(findPendingIndex(id)!=-1) return;
   if(pendingCount<MAX_PENDING){
     pendings[pendingCount].id=id;
@@ -220,8 +302,8 @@ void requestAccess(String id, String name){
   sendToAllAdmins(msg);
   bot->sendMessage(id,"Запрос отправлен администраторам.");
 }
-
 void approveRequest(String id, String role, int hours){
+  if (!bot) return;
   int p=findPendingIndex(id);
   if(p!=-1){
     for(int j=p;j<pendingCount-1;j++) pendings[j]=pendings[j+1];
@@ -240,8 +322,8 @@ void approveRequest(String id, String role, int hours){
   bot->sendMessage(id,"Вам выдан доступ: "+role);
   sendToAllAdmins("Пользователь "+id+" получил права "+role);
 }
-
 void rejectRequest(String id){
+  if (!bot) return;
   int p=findPendingIndex(id);
   if(p!=-1){
     for(int j=p;j<pendingCount-1;j++) pendings[j]=pendings[j+1];
@@ -249,22 +331,20 @@ void rejectRequest(String id){
   }
   bot->sendMessage(id,"Ваш запрос отклонён.");
 }
-
 void removeUserById(String id){
   int idx=findUserIndex(id);
   if(idx==-1) return;
   for(int i=idx;i<userCount-1;i++) users[i]=users[i+1];
   userCount--; saveUsers();
 }
-
 void sendUserList(String chat){
+  if (!bot) return;
   String msg="Пользователи:\n";
   for(int i=0;i<userCount;i++){
     msg+=users[i].id+" - "+users[i].role+"\n";
   }
   bot->sendMessage(chat,msg);
 }
-
 void checkExpiredUsers(){
   unsigned long now=time(nullptr); bool changed=false;
   for(int i=0;i<userCount;i++){
@@ -274,7 +354,6 @@ void checkExpiredUsers(){
   }
   if(changed) saveUsers();
 }
-
 String getHelpText(String role){
   String m="Команды:\n/help - помощь\n";
   m+="/open - открыть ворота\n";
@@ -286,25 +365,47 @@ String getHelpText(String role){
   m+="/request - запросить доступ";
   return m;
 }
-
 void sendAvailableCommands(String chat, String role){
+  if (!bot) return;
   bot->sendMessage(chat,getHelpText(role));
 }
-
 void sendAdminStatusWithStats(String chat){
-  String msg="Статус:\n";
-  unsigned long up=millis()/1000;
-  msg += "Аптайм: " + String(up/3600) + " ч " + String((up%3600)/60) + " м";
-  msg += "\nВерсия: " + currentVersion;
-  msg += "\nПредыдущая версия: " + previousVersion;
+  if (!bot) return;
+  String msg = "\xF0\x9F\x93\x8A *Статус первой платы*\n\n"; 
+  unsigned long up = millis() / 1000;
+  unsigned long days = up / 86400;
+  unsigned long hours = (up % 86400) / 3600;
+  unsigned long mins = (up % 3600) / 60;
+  unsigned long secs = up % 60;
+  msg += "\xF0\x9F\x95\x92 *Время работы*: ";
+  if(days>0) msg += String(days)+" д ";
+  if(days>0 || hours>0) msg += String(hours)+" ч ";
+  msg += String(mins)+" мин "+String(secs)+" сек\n";
+  msg += "\xF0\x9F\x93\x89 *Фрагментация памяти*: " + String(ESP.getHeapFragmentation()) + "%\n";
+  msg += "\xF0\x9F\x97\x83 *Свободно для скетча*: " + String(ESP.getFreeSketchSpace()/1024) + " КБ\n";
+  msg += "\xF0\x9F\x94\x8B *Текущая версия прошивки*: " + currentVersion + "\n";
+  msg += "\xF0\x9F\x94\x8B *Предыдущая версия*: " + previousVersion + "\n";
+  msg += "\xF0\x9F\x95\xB0 *Текущее время*: `" + getCurrentTimeStr() + "`\n";
+  msg += "\n\xF0\x9F\x93\xA1 *Wi-Fi*:\n";
   if(WiFi.status()==WL_CONNECTED){
-    msg += "\nIP: " + WiFi.localIP().toString();
+    msg += "\xE2\x80\xA2 Подключено к сети: " + WiFi.SSID() + "\n";
+    msg += "\xE2\x80\xA2 Локальный IP: `" + WiFi.localIP().toString() + "`\n";
+    msg += "\xE2\x80\xA2 MAC-адрес: `" + WiFi.macAddress() + "`\n";
+    msg += "\xE2\x80\xA2 Шлюз: `" + WiFi.gatewayIP().toString() + "`\n";
+    msg += "\xE2\x80\xA2 Маска подсети: `" + WiFi.subnetMask().toString() + "`\n";
+    msg += "\xE2\x80\xA2 DNS: `" + WiFi.dnsIP().toString() + "`";
   }
-  bot->sendMessage(chat,msg);
+  String second;
+  if(getSecondStatus(second))
+    bot->sendMessage(chat, second, "Markdown");
+  else
+    bot->sendMessage(chat, "Вторая плата не подключена");
+  bot->sendMessage(chat, msg, "Markdown");
 }
 
-// ===== UDP discovery =====
+// ===== Поиск второй платы (UDP) =====
 void broadcastHello(){
+  if(!networkReady) return;
   if(millis()-lastHello>5000){
     udp.beginPacket(IPAddress(255,255,255,255),udpPort);
     udp.write("FIRST-HELLO");
@@ -313,6 +414,7 @@ void broadcastHello(){
   }
 }
 void listenHello(){
+  if(!networkReady) return;
   int ps=udp.parsePacket();
   if(ps){
     char buf[32];
@@ -330,37 +432,101 @@ void listenHello(){
   }
 }
 
-// ===== HTTP helpers =====
-void sendCards(){
-  if(!secondIP) return;
+// ===== Обмен по HTTP =====
+bool sendCards(){
+  if(!networkReady || !secondIP){
+    Serial.println("[HTTP] IP второй платы неизвестен или нет сети");
+    return false;
+  }
   WiFiClient client; HTTPClient http;
   String url=String("http://")+secondIP.toString()+"/update_cards";
   String body="";
   for(int i=0;i<cardCount;i++){body+=cards[i].uid; if(i<cardCount-1) body+=",";}
-  if(http.begin(client,url)){ http.POST(body); http.end(); }
+  if(!http.begin(client,url)){
+    Serial.println("[HTTP] Не удалось сформировать запрос /update_cards");
+    return false;
+  }
+  int code=http.POST(body);
+  http.end();
+  if(code!=200){
+    Serial.printf("[HTTP] Ошибка отправки карт: %d\n", code);
+    return false;
+  }
+  return true;
 }
 String requestCard(){
-  if(!secondIP) return "";
+  if(!networkReady || !secondIP){
+    Serial.println("[HTTP] IP второй платы неизвестен или нет сети");
+    return "";
+  }
   WiFiClient client; HTTPClient http;
   String url=String("http://")+secondIP.toString()+"/request_card";
-  if(http.begin(client,url)){ int code=http.GET(); String r=""; if(code==200) r=http.getString(); http.end(); return r; } return ""; }
+  if(!http.begin(client,url)){
+    Serial.println("[HTTP] Ошибка запроса /request_card");
+    return "";
+  }
+  int code=http.GET();
+  String r="";
+  if(code==200) r=http.getString();
+  else Serial.printf("[HTTP] Код ответа /request_card: %d\n", code);
+  http.end();
+  return r;
+}
 void openGate(){
-  if(!secondIP) return;
+  if(!networkReady || !secondIP){
+    Serial.println("[HTTP] IP второй платы неизвестен или нет сети");
+    return;
+  }
   WiFiClient client; HTTPClient http;
   String url=String("http://")+secondIP.toString()+"/command?open=1";
-  if(http.begin(client,url)){ http.GET(); http.end(); }
+  if(!http.begin(client,url)){
+    Serial.println("[HTTP] Не удалось сформировать запрос открытия");
+    return;
+  }
+  int code=http.GET();
+  http.end();
+  if(code!=200) Serial.printf("[HTTP] Ошибка открытия ворот: %d\n", code);
 }
-
-// запрос на перезагрузку второй платы
 void rebootSecondBoard(){
-  if(!secondIP) return;
+  if(!networkReady || !secondIP){
+    Serial.println("[HTTP] IP второй платы неизвестен или нет сети");
+    return;
+  }
   WiFiClient client; HTTPClient http;
   String url=String("http://")+secondIP.toString()+"/reboot";
-  if(http.begin(client,url)){ http.GET(); http.end(); }
+  if(!http.begin(client,url)){
+    Serial.println("[HTTP] Не удалось отправить запрос перезагрузки");
+    return;
+  }
+  int code=http.GET();
+  http.end();
+  if(code!=200) Serial.printf("[HTTP] Ошибка перезагрузки второй платы: %d\n", code);
+}
+bool getSecondStatus(String &out){
+  if(!networkReady || !secondIP){
+    Serial.println("[HTTP] IP второй платы неизвестен или нет сети");
+    return false;
+  }
+  WiFiClient client; HTTPClient http;
+  String url = String("http://") + secondIP.toString() + "/status";
+  if(!http.begin(client, url)){
+    Serial.println("[HTTP] Ошибка запроса статуса");
+    return false;
+  }
+  int code = http.GET();
+  if(code==200){
+    out = http.getString();
+    http.end();
+    return true;
+  }
+  Serial.printf("[HTTP] Код статуса: %d\n", code);
+  http.end();
+  return false;
 }
 
-// ===== WEB UI =====
+// ===== Веб-интерфейс =====
 void handleRoot(){
+  if(!apServer.authenticate(WEB_USER, WEB_PASS)) return apServer.requestAuthentication();
   String html="<html><body><h2>Настройка</h2><form method='POST' action='/setup'>";
   html+="SSID: <input name='s' value='"+getSSID()+"'><br>";
   html+="PASS: <input name='p' value='"+getPass()+"'><br>";
@@ -370,6 +536,7 @@ void handleRoot(){
   apServer.send(200,"text/html",html);
 }
 void handleSetup(){
+  if(!apServer.authenticate(WEB_USER, WEB_PASS)) return apServer.requestAuthentication();
   if(apServer.hasArg("s")) saveEEPROMString(WIFI_SSID_ADDR,apServer.arg("s").c_str(),64);
   if(apServer.hasArg("p")) saveEEPROMString(WIFI_PASS_ADDR,apServer.arg("p").c_str(),64);
   if(apServer.hasArg("b")) saveEEPROMString(BOT_TOKEN_ADDR,apServer.arg("b").c_str(),128);
@@ -378,10 +545,8 @@ void handleSetup(){
   delay(1000); ESP.restart();
 }
 void setupWeb(){ apServer.on("/",handleRoot); apServer.on("/setup",HTTP_POST,handleSetup); httpUpdater.setup(&apServer); apServer.begin(); }
-
-// ===== Telegram =====
-// вывод списка карт с информацией о сроке действия
 void sendCardList(String chat){
+  if (!bot) return;
   unsigned long now = time(nullptr);
   String msg = "Список карт:\n";
   for(int i=0;i<cardCount;i++){
@@ -399,6 +564,7 @@ void sendCardList(String chat){
   bot->sendMessage(chat, msg);
 }
 void handleTelegram(){
+  if (!bot) return;
   static unsigned long lastPoll=0; if(millis()-lastPoll<1200) return; lastPoll=millis();
   int n=bot->getUpdates(bot->last_message_received + 1);
   for(int i=0;i<n;i++){
@@ -410,14 +576,23 @@ void handleTelegram(){
     String role = (uidx!=-1)?users[uidx].role:"user";
 
     if(rebootConfirmChat==chat && millis()-rebootRequestTime<10000 && (text=="/reboot" || text=="Перезапуск")){
-      bot->sendMessage(chat,"Перезагрузка обоих устройств...");
-      notifyAdminsReboot();
+      sendToAllAdmins("Запрос перезагрузки: перезагружаю вторую плату");
       rebootSecondBoard();
-      delay(1000);
+      unsigned long waitStart=millis();
+      bool ok=false;
+      while(millis()-waitStart<10000){
+        listenHello();
+        if(secondIP){ ok=true; break; }
+        delay(100);
+      }
+      if(ok) sendToAllAdmins("Вторая плата перезагрузилась");
+      else sendToAllAdmins("Не удалось подтвердить перезагрузку второй платы");
+      sendToAllAdmins("Первая плата перезагружается");
+      notifyAdminsReboot();
+      delay(500);
       ESP.restart();
     }
 
-    // этап ввода имени и срока действия при добавлении карты
     if(addCardMode && chat==getAdmin()){
       if(pendingUID.length()>0 && pendingName==""){
         pendingName=text;
@@ -438,61 +613,167 @@ void handleTelegram(){
         int next=1; for(int j=0;j<cardCount;j++) if(cards[j].number>=next) next=cards[j].number+1;
         if(cardCount<MAX_CARDS){
           cards[cardCount++]={next,pendingUID,pendingName,exp,temp};
-          saveCards(); sendCards();
-          bot->sendMessage(chat,"Карта добавлена! UID: "+pendingUID);
+          if(saveCards() && sendCards())
+            bot->sendMessage(chat,"Карта добавлена! UID: "+pendingUID);
+          else
+            bot->sendMessage(chat,"Ошибка сохранения карт");
         } else bot->sendMessage(chat,"Лимит карт заполнен");
         addCardMode=false; pendingUID=""; pendingName="";
         continue;
       }
     }
-    if(text=="/open" || text=="Открыть ворота"){ openGate(); bot->sendMessage(chat,"Ворота открыты"); }
-    else if(text=="/cardlist" || text=="Список карт"){ sendCardList(chat); }
-    else if(text.startsWith("Удалитькарту-") && role=="admin"){ int num=text.substring(text.indexOf('-')+1).toInt(); for(int j=0;j<cardCount;j++) if(cards[j].number==num){ for(int k=j;k<cardCount-1;k++) cards[k]=cards[k+1]; cardCount--; saveCards(); sendCards(); bot->sendMessage(chat,"Карта удалена"); break; } }
-    else if((text=="/addcard" || text=="Добавить карту") && role=="admin"){ addCardMode=true; pendingUID=requestCard(); if(pendingUID.length()){ bot->sendMessage(chat,"Карта считана. UID: `"+pendingUID+"`\nВведите имя владельца:","Markdown"); } else { bot->sendMessage(chat,"Не удалось считать карту"); addCardMode=false; } }
-    else if(text=="/users" || text=="Пользователи"){ if(role=="admin") sendUserList(chat); else bot->sendMessage(chat,"Нет доступа"); }
-    else if(text.startsWith("/grant-") && role=="admin"){ int p1=text.indexOf('-',7); int p2=text.indexOf('-',p1+1); String uid=text.substring(7,p1); String rl=text.substring(p1+1,p2); int hrs=text.substring(p2+1).toInt(); approveRequest(uid,rl,hrs); }
-    else if(text.startsWith("/reject-") && role=="admin"){ String uid=text.substring(8); rejectRequest(uid); }
-    else if(text.startsWith("Удалить-") && role=="admin"){ String uid=text.substring(text.indexOf('-')+1); removeUserById(uid); bot->sendMessage(chat,"Пользователь удалён"); }
-    else if(text=="/request" || text=="Запросить доступ"){ requestAccess(fromId,userName); }
-    else if(text=="/help" || text=="Помощь"){ sendAvailableCommands(chat,role); }
-    else if(text=="/status" || text=="Статус"){ if(role=="admin") sendAdminStatusWithStats(chat); else bot->sendMessage(chat,"Версия "+currentVersion); }
-    else if(text=="/reboot" || text=="Перезапуск"){ if(role=="admin"){ rebootConfirmChat=chat; rebootRequestTime=millis(); bot->sendMessage(chat,"Повторите команду ещё раз для подтверждения"); } }
-    else sendAvailableCommands(chat,role);
+    Cmd cmd = parseCmd(text);
+    switch(cmd){
+      case CMD_OPEN:
+        openGate();
+        bot->sendMessage(chat,"Ворота открыты");
+        break;
+      case CMD_CARDLIST:
+        sendCardList(chat);
+        break;
+      case CMD_DELETE_CARD:
+        if(role=="admin"){ int num=text.substring(text.indexOf("-")+1).toInt();
+          for(int j=0;j<cardCount;j++) if(cards[j].number==num){
+            for(int k=j;k<cardCount-1;k++) cards[k]=cards[k+1];
+            cardCount--; if(saveCards() && sendCards())
+              bot->sendMessage(chat,"Карта удалена");
+            else bot->sendMessage(chat,"Ошибка удаления карты");
+            break; } }
+        break;
+      case CMD_ADD:
+        if(role=="admin"){ addCardMode=true; pendingUID=requestCard();
+          if(pendingUID.length())
+            bot->sendMessage(chat,"Карта считана. UID: `"+pendingUID+"`\nВведите имя владельца:","Markdown");
+          else {
+            String err = secondIP ? "Не удалось считать карту" : "Вторая плата не подключена";
+            bot->sendMessage(chat, err);
+            addCardMode=false;
+          } }
+        break;
+      case CMD_USERS:
+        if(role=="admin") sendUserList(chat); else bot->sendMessage(chat,"Нет доступа");
+        break;
+      case CMD_GRANT:
+        if(role=="admin"){ int p1=text.indexOf("-",7); int p2=text.indexOf("-",p1+1); String uid=text.substring(7,p1); String rl=text.substring(p1+1,p2); int hrs=text.substring(p2+1).toInt(); approveRequest(uid,rl,hrs); }
+        break;
+      case CMD_REJECT:
+        if(role=="admin"){ String uid=text.substring(8); rejectRequest(uid); }
+        break;
+      case CMD_REQUEST:
+        requestAccess(fromId,userName);
+        break;
+      case CMD_HELP:
+        sendAvailableCommands(chat,role);
+        break;
+      case CMD_STATUS:
+        if(role=="admin") sendAdminStatusWithStats(chat); else bot->sendMessage(chat,"Версия "+currentVersion);
+        break;
+      case CMD_REBOOT:
+        if(role=="admin"){ rebootConfirmChat=chat; rebootRequestTime=millis(); bot->sendMessage(chat,"Повторите команду ещё раз для подтверждения"); }
+        break;
+      case CMD_NONE:
+      default:
+        if(text.startsWith("Удалить-") && role=="admin"){ String uid=text.substring(text.indexOf("-")+1); removeUserById(uid); bot->sendMessage(chat,"Пользователь удалён"); }
+        else sendAvailableCommands(chat,role);
+    }
   }
 }
 
+// Подключение к Wi-Fi или запуск точки доступа при неудаче
 void connectWiFi(){
-  WiFi.mode(WIFI_STA); WiFi.begin(getSSID().c_str(), getPass().c_str());
-  unsigned long start=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-start<15000){ delay(500); }
+  Serial.println("[WiFi] Попытка подключения...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(getSSID().c_str(), getPass().c_str());
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(500);
+    Serial.print('.');
+  }
+  Serial.println();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Не удалось подключиться, включаю AP");
+    WiFi.disconnect();
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_NAME);
+    Serial.print("[WiFi] Точка доступа запущена, IP: ");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.print("[WiFi] Подключено, IP: ");
+    Serial.println(WiFi.localIP());
+  }
 }
 
+// обновление мигания светодиода
+void updateLed(){
+  bool ap = (WiFi.status() != WL_CONNECTED);
+  unsigned long onMs = ap ? 1500 : 500;
+  unsigned long offMs = ap ? 1000 : 500;
+  unsigned long interval = ledState ? onMs : offMs;
+  if(millis() - ledTimer >= interval){
+    ledTimer = millis();
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState ? LOW : HIGH);
+  }
+}
+
+// === MAIN SETUP/LOOP ===
+
 void setup(){
-  Serial.begin(115200); SPIFFS.begin(); EEPROM.begin(EEPROM_SIZE);
-  setupWeb();
+  Serial.begin(115200);
+  delay(500); 
+  Serial.println();
+  Serial.println("=== ЗАПУСК ПЕРВОЙ ПЛАТЫ ===");
+  Serial.print("Причина последнего сброса: ");
+  Serial.println(ESP.getResetReason());
+
+  if(!SPIFFS.begin())
+    Serial.println("[ERR] Не удалось смонтировать SPIFFS");
+  else
+    Serial.println("[INFO] SPIFFS смонтирован");
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
   connectWiFi();
-  udp.begin(udpPort);
-  tgClient.setInsecure();
-  bot=new UniversalTelegramBot(getToken(), tgClient);
-  configTime(5*3600,0,"pool.ntp.org","time.nist.gov");
-  loadCards();
-  loadUsers();
-  ensureMainAdmin();
-  notifyAdminsReboot();
+  setupWeb();
+
+  networkReady = (WiFi.status() == WL_CONNECTED);
+
+  if(networkReady){
+    Serial.println("[INFO] Запуск сетевых сервисов");
+    udp.begin(udpPort);
+    tgClient.setInsecure();
+    bot = new UniversalTelegramBot(getToken(), tgClient);
+
+    configTime(5*3600,0,"pool.ntp.org","time.nist.gov");
+
+    loadCards();
+    loadUsers();
+    ensureMainAdmin();
+    Serial.printf("[INFO] Свободная память: %u байт\n", ESP.getFreeHeap());
+    notifyAdminsReboot();
+  } else {
+    Serial.println("[INFO] Работаем в режиме точки доступа, сетевые сервисы не запускаем");
+  }
 }
 
 void loop(){
   apServer.handleClient();
-  broadcastHello();
-  listenHello();
-  handleTelegram();
-  static unsigned long lastExp = 0;
-  if(millis()-lastExp > 60000){
-    lastExp = millis();
-    removeExpiredCards();
-    checkExpiredUsers();
-  }
-  if(rebootConfirmChat!="" && millis()-rebootRequestTime>10000){
-    rebootConfirmChat="";
+  updateLed();
+
+  if(networkReady) {
+    broadcastHello();
+    listenHello();
+    handleTelegram();
+    static unsigned long lastExp = 0;
+    if(millis()-lastExp > 60000){
+      lastExp = millis();
+      removeExpiredCards();
+      checkExpiredUsers();
+    }
+    if(rebootConfirmChat!="" && millis()-rebootRequestTime>10000){
+      rebootConfirmChat="";
+    }
   }
   delay(5);
 }
