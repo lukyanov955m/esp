@@ -28,6 +28,21 @@ ESP8266WebServer apServer(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 #define MAX_CARDS 32
+#define MAX_USERS 8
+#define MAX_PENDING 4
+
+// ===== Структуры =====
+struct User {
+  String id;             // ID пользователя в Telegram
+  String name;           // имя пользователя
+  String role;           // admin/guest/user
+  unsigned long expire;  // время окончания гостевого доступа
+};
+struct Pending {
+  String id;
+  String name;
+};
+
 // Структура карты доступа
 struct Card {
   int number;             // порядковый номер
@@ -39,6 +54,12 @@ struct Card {
 Card cards[MAX_CARDS];
 int cardCount = 0;        // количество карт в памяти
 const char* cardsFile = "/cards.json";
+
+User users[MAX_USERS];
+int userCount = 0;
+Pending pendings[MAX_PENDING];
+int pendingCount = 0;
+const char* usersFile = "/users.json";
 
 String currentVersion = "1.0";
 // переменные для добавления карты
@@ -123,6 +144,146 @@ void removeExpiredCards(){
   if(changed) saveCards();
 }
 
+// ===== Работа с пользователями =====
+int findUserIndex(String id){
+  for(int i=0;i<userCount;i++) if(users[i].id==id) return i;
+  return -1;
+}
+int findPendingIndex(String id){
+  for(int i=0;i<pendingCount;i++) if(pendings[i].id==id) return i;
+  return -1;
+}
+
+void saveUsers(){
+  DynamicJsonDocument doc(1024);
+  JsonArray arr = doc.to<JsonArray>();
+  for(int i=0;i<userCount;i++){
+    JsonObject o=arr.createNestedObject();
+    o["id"]=users[i].id;
+    o["name"]=users[i].name;
+    o["role"]=users[i].role;
+    o["expire"]=users[i].expire;
+  }
+  File f=SPIFFS.open(usersFile,"w");
+  if(f){serializeJson(doc,f);f.close();}
+}
+
+void loadUsers(){
+  userCount=0;
+  if(!SPIFFS.exists(usersFile)) return;
+  File f=SPIFFS.open(usersFile,"r"); if(!f) return;
+  DynamicJsonDocument doc(1024); DeserializationError err=deserializeJson(doc,f);
+  if(err){f.close(); return;}
+  for(JsonObject o: doc.as<JsonArray>()){
+    if(userCount>=MAX_USERS) break;
+    users[userCount].id=o["id"].as<String>();
+    users[userCount].name=o["name"].as<String>();
+    users[userCount].role=o["role"].as<String>();
+    users[userCount].expire=o["expire"].as<unsigned long>();
+    userCount++;
+  }
+  f.close();
+}
+
+void ensureMainAdmin(){
+  if(findUserIndex(getAdmin())==-1 && userCount<MAX_USERS){
+    users[userCount].id=getAdmin();
+    users[userCount].name="Главный админ";
+    users[userCount].role="admin";
+    users[userCount].expire=0;
+    userCount++;
+    saveUsers();
+  }
+}
+
+void sendToAllAdmins(String msg){
+  for(int i=0;i<userCount;i++) if(users[i].role=="admin")
+    bot->sendMessage(users[i].id,msg);
+}
+
+void requestAccess(String id, String name){
+  if(findPendingIndex(id)!=-1) return;
+  if(pendingCount<MAX_PENDING){
+    pendings[pendingCount].id=id;
+    pendings[pendingCount].name=name;
+    pendingCount++;
+  }
+  String msg="Пользователь "+name+" ("+id+") просит доступ.";
+  msg+="\nДля выдачи: /grant-"+id+"-guest-6 или /grant-"+id+"-admin";
+  sendToAllAdmins(msg);
+  bot->sendMessage(id,"Запрос отправлен администраторам.");
+}
+
+void approveRequest(String id, String role, int hours){
+  int p=findPendingIndex(id);
+  if(p!=-1){
+    for(int j=p;j<pendingCount-1;j++) pendings[j]=pendings[j+1];
+    pendingCount--;
+  }
+  int idx=findUserIndex(id);
+  if(idx==-1 && userCount<MAX_USERS){
+    idx=userCount++;
+  }
+  users[idx].id=id;
+  users[idx].name="User";
+  users[idx].role=role;
+  if(role=="guest" && hours>0) users[idx].expire=time(nullptr)+hours*3600;
+  else users[idx].expire=0;
+  saveUsers();
+  bot->sendMessage(id,"Вам выдан доступ: "+role);
+  sendToAllAdmins("Пользователь "+id+" получил права "+role);
+}
+
+void rejectRequest(String id){
+  int p=findPendingIndex(id);
+  if(p!=-1){
+    for(int j=p;j<pendingCount-1;j++) pendings[j]=pendings[j+1];
+    pendingCount--;
+  }
+  bot->sendMessage(id,"Ваш запрос отклонён.");
+}
+
+void removeUserById(String id){
+  int idx=findUserIndex(id);
+  if(idx==-1) return;
+  for(int i=idx;i<userCount-1;i++) users[i]=users[i+1];
+  userCount--; saveUsers();
+}
+
+void sendUserList(String chat){
+  String msg="Пользователи:\n";
+  for(int i=0;i<userCount;i++){
+    msg+=users[i].id+" - "+users[i].role+"\n";
+  }
+  bot->sendMessage(chat,msg);
+}
+
+void checkExpiredUsers(){
+  unsigned long now=time(nullptr); bool changed=false;
+  for(int i=0;i<userCount;i++){
+    if(users[i].role=="guest" && users[i].expire>0 && users[i].expire<=now){
+      users[i].role="user"; users[i].expire=0; changed=true;
+    }
+  }
+  if(changed) saveUsers();
+}
+
+String getHelpText(String role){
+  String m="Команды:\n/help - помощь\n";
+  m+="/open - открыть ворота\n";
+  if(role=="admin"){
+    m+="/users - список пользователей\n";
+    m+="/addcard - добавить карту\n";
+    m+="/cardlist - список карт\n";
+  }
+  m+="/request - запросить доступ";
+  return m;
+}
+
+void sendAvailableCommands(String chat, String role){
+  bot->sendMessage(chat,getHelpText(role));
+}
+
 // ===== UDP discovery =====
 void broadcastHello(){
   if(millis()-lastHello>5000){
@@ -205,6 +366,11 @@ void handleTelegram(){
   for(int i=0;i<n;i++){
     String chat=bot->messages[i].chat_id;
     String text=bot->messages[i].text;
+    String fromId = String(bot->messages[i].from_id);
+    String userName = bot->messages[i].from_name;
+    int uidx = findUserIndex(fromId);
+    String role = (uidx!=-1)?users[uidx].role:"user";
+
     // этап ввода имени и срока действия при добавлении карты
     if(addCardMode && chat==getAdmin()){
       if(pendingUID.length()>0 && pendingName==""){
@@ -235,10 +401,16 @@ void handleTelegram(){
     }
     if(text=="/open" || text=="Открыть ворота"){ openGate(); bot->sendMessage(chat,"Ворота открыты"); }
     else if(text=="/cardlist" || text=="Список карт"){ sendCardList(chat); }
-    else if(text.startsWith("Удалитькарту-")){ int num=text.substring(text.indexOf('-')+1).toInt(); for(int j=0;j<cardCount;j++) if(cards[j].number==num){ for(int k=j;k<cardCount-1;k++) cards[k]=cards[k+1]; cardCount--; saveCards(); sendCards(); bot->sendMessage(chat,"Карта удалена"); break; } }
-    else if(text=="/addcard" || text=="Добавить карту"){ addCardMode=true; pendingUID=requestCard(); if(pendingUID.length()){ bot->sendMessage(chat,"Карта считана. UID: `"+pendingUID+"`\nВведите имя владельца:","Markdown"); } else { bot->sendMessage(chat,"Не удалось считать карту"); addCardMode=false; } }
+    else if(text.startsWith("Удалитькарту-") && role=="admin"){ int num=text.substring(text.indexOf('-')+1).toInt(); for(int j=0;j<cardCount;j++) if(cards[j].number==num){ for(int k=j;k<cardCount-1;k++) cards[k]=cards[k+1]; cardCount--; saveCards(); sendCards(); bot->sendMessage(chat,"Карта удалена"); break; } }
+    else if((text=="/addcard" || text=="Добавить карту") && role=="admin"){ addCardMode=true; pendingUID=requestCard(); if(pendingUID.length()){ bot->sendMessage(chat,"Карта считана. UID: `"+pendingUID+"`\nВведите имя владельца:","Markdown"); } else { bot->sendMessage(chat,"Не удалось считать карту"); addCardMode=false; } }
+    else if(text=="/users" || text=="Пользователи"){ if(role=="admin") sendUserList(chat); else bot->sendMessage(chat,"Нет доступа"); }
+    else if(text.startsWith("/grant-") && role=="admin"){ int p1=text.indexOf('-',7); int p2=text.indexOf('-',p1+1); String uid=text.substring(7,p1); String rl=text.substring(p1+1,p2); int hrs=text.substring(p2+1).toInt(); approveRequest(uid,rl,hrs); }
+    else if(text.startsWith("/reject-") && role=="admin"){ String uid=text.substring(8); rejectRequest(uid); }
+    else if(text.startsWith("Удалить-") && role=="admin"){ String uid=text.substring(text.indexOf('-')+1); removeUserById(uid); bot->sendMessage(chat,"Пользователь удалён"); }
+    else if(text=="/request" || text=="Запросить доступ"){ requestAccess(fromId,userName); }
+    else if(text=="/help" || text=="Помощь"){ sendAvailableCommands(chat,role); }
     else if(text=="/status" || text=="Статус"){ bot->sendMessage(chat,"Версия "+currentVersion); }
-    else bot->sendMessage(chat,"Неизвестная команда");
+    else sendAvailableCommands(chat,role);
   }
 }
 
@@ -256,6 +428,8 @@ void setup(){
   bot=new UniversalTelegramBot(getToken(), tgClient);
   configTime(5*3600,0,"pool.ntp.org","time.nist.gov");
   loadCards();
+  loadUsers();
+  ensureMainAdmin();
 }
 
 void loop(){
@@ -264,6 +438,10 @@ void loop(){
   listenHello();
   handleTelegram();
   static unsigned long lastExp = 0;
-  if(millis()-lastExp > 60000){ lastExp = millis(); removeExpiredCards(); }
+  if(millis()-lastExp > 60000){
+    lastExp = millis();
+    removeExpiredCards();
+    checkExpiredUsers();
+  }
   delay(5);
 }
