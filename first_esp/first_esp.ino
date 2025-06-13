@@ -351,6 +351,14 @@ void openGate(){
   if(http.begin(client,url)){ http.GET(); http.end(); }
 }
 
+// запрос на перезагрузку второй платы
+void rebootSecondBoard(){
+  if(!secondIP) return;
+  WiFiClient client; HTTPClient http;
+  String url=String("http://")+secondIP.toString()+"/reboot";
+  if(http.begin(client,url)){ http.GET(); http.end(); }
+}
+
 // ===== WEB UI =====
 void handleRoot(){
   String html="<html><body><h2>Настройка</h2><form method='POST' action='/setup'>";
@@ -402,8 +410,9 @@ void handleTelegram(){
     String role = (uidx!=-1)?users[uidx].role:"user";
 
     if(rebootConfirmChat==chat && millis()-rebootRequestTime<10000 && (text=="/reboot" || text=="Перезапуск")){
-      bot->sendMessage(chat,"Перезагрузка...");
+      bot->sendMessage(chat,"Перезагрузка обоих устройств...");
       notifyAdminsReboot();
+      rebootSecondBoard();
       delay(1000);
       ESP.restart();
     }

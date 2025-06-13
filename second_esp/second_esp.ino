@@ -119,6 +119,12 @@ void handleRequestCard(){
   server.send(200,"text/plain",uid);
 }
 
+void handleReboot(){
+  server.send(200,"text/plain","REBOOTING");
+  delay(500);
+  ESP.restart();
+}
+
 // ===== Main card check =====
 void checkCard(){
   String uid=readCard();
@@ -141,6 +147,7 @@ void setup(){
   server.on("/command",handleCommand);
   server.on("/update_cards",HTTP_POST,handleUpdate);
   server.on("/request_card",handleRequestCard);
+  server.on("/reboot",handleReboot);
   server.begin();
   loadCards();
 }
