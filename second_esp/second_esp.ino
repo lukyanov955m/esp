@@ -12,6 +12,12 @@
 #define RELAY_PIN 15
 #define BUZZER_PIN 5
 #define RELAY_OPEN_TIME 2000
+#define BUZZER_TONE_OK 1500
+#define BUZZER_TONE_ERR 400
+#define BEEP_DURATION 200
+#define BEEP_PAUSE 120
+#define BEEP_OK_COUNT 3
+#define BEEP_ERR_COUNT 5
 
 WiFiUDP udp;
 const unsigned int udpPort=4210;
@@ -61,8 +67,20 @@ void listenHello(){
 }
 
 // ===== Hardware =====
+void beepMultiple(int toneVal, int count){
+  for(int i=0;i<count;i++){
+    tone(BUZZER_PIN, toneVal, BEEP_DURATION);
+    delay(BEEP_DURATION);
+    noTone(BUZZER_PIN);
+    delay(BEEP_PAUSE);
+  }
+}
+
 void openGate(){
-  digitalWrite(RELAY_PIN,LOW); delay(RELAY_OPEN_TIME); digitalWrite(RELAY_PIN,HIGH);
+  digitalWrite(RELAY_PIN,LOW);
+  beepMultiple(BUZZER_TONE_OK, BEEP_OK_COUNT);
+  delay(RELAY_OPEN_TIME);
+  digitalWrite(RELAY_PIN,HIGH);
 }
 String readCard(){
   if(!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) return "";
@@ -97,6 +115,7 @@ void handleRequestCard(){
     uid=readCard();
     delay(100);
   }
+  if(uid!="") beepMultiple(BUZZER_TONE_OK,1);
   server.send(200,"text/plain",uid);
 }
 
@@ -105,6 +124,8 @@ void checkCard(){
   String uid=readCard();
   if(uid=="") return;
   for(int i=0;i<cardCount;i++) if(cards[i]==uid){ openGate(); return; }
+  // если карта не найдена
+  beepMultiple(BUZZER_TONE_ERR, BEEP_ERR_COUNT);
 }
 
 void setup(){

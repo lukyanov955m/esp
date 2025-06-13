@@ -27,13 +27,24 @@ UniversalTelegramBot* bot = nullptr;
 ESP8266WebServer apServer(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
-struct Card { int number; String uid; String name; };
 #define MAX_CARDS 32
+// Структура карты доступа
+struct Card {
+  int number;             // порядковый номер
+  String uid;             // UID карты
+  String name;            // имя владельца
+  unsigned long expire;   // время окончания действия, 0 - постоянно
+  bool isTemp;            // временная карта
+};
 Card cards[MAX_CARDS];
-int cardCount = 0;
+int cardCount = 0;        // количество карт в памяти
 const char* cardsFile = "/cards.json";
 
 String currentVersion = "1.0";
+// переменные для добавления карты
+bool addCardMode = false;
+String pendingUID = "";
+String pendingName = "";
 
 // ===== EEPROM helpers =====
 void getEEPROMString(int addr, char* dest, size_t maxLen, const char* def="") {
@@ -74,9 +85,11 @@ void loadCards(){
   if(err){f.close();return;}
   for(JsonObject obj: doc.as<JsonArray>()){
     if(cardCount>=MAX_CARDS) break;
-    cards[cardCount].number=obj["number"].as<int>();
-    cards[cardCount].uid=obj["uid"].as<String>();
-    cards[cardCount].name=obj["name"].as<String>();
+    cards[cardCount].number = obj["number"].as<int>();
+    cards[cardCount].uid    = obj["uid"].as<String>();
+    cards[cardCount].name   = obj["name"].as<String>();
+    cards[cardCount].expire = obj["expire"].as<unsigned long>();
+    cards[cardCount].isTemp = obj["isTemp"].as<bool>();
     cardCount++;}
   f.close();
 }
@@ -85,12 +98,29 @@ void saveCards(){
   JsonArray arr=doc.to<JsonArray>();
   for(int i=0;i<cardCount;i++){
     JsonObject o=arr.createNestedObject();
-    o["number"]=cards[i].number;
-    o["uid"]=cards[i].uid;
-    o["name"]=cards[i].name;
+    o["number"] = cards[i].number;
+    o["uid"]    = cards[i].uid;
+    o["name"]   = cards[i].name;
+    o["expire"] = cards[i].expire;
+    o["isTemp"] = cards[i].isTemp;
   }
   File f=SPIFFS.open(cardsFile,"w");
   if(f){serializeJson(doc,f);f.close();}
+}
+
+// удаляем просроченные временные карты
+void removeExpiredCards(){
+  unsigned long now = time(nullptr);
+  bool changed = false;
+  int i = 0;
+  while(i < cardCount){
+    if(cards[i].isTemp && cards[i].expire > 0 && cards[i].expire <= now){
+      for(int j=i;j<cardCount-1;j++) cards[j]=cards[j+1];
+      cardCount--; changed = true; continue;
+    }
+    i++;
+  }
+  if(changed) saveCards();
 }
 
 // ===== UDP discovery =====
@@ -151,8 +181,23 @@ void handleSetup(){
 void setupWeb(){ apServer.on("/",handleRoot); apServer.on("/setup",HTTP_POST,handleSetup); httpUpdater.setup(&apServer); apServer.begin(); }
 
 // ===== Telegram =====
+// вывод списка карт с информацией о сроке действия
 void sendCardList(String chat){
-  String msg="Список карт:\n"; for(int i=0;i<cardCount;i++){msg+=String(cards[i].number)+". "+cards[i].name+" ("+cards[i].uid+")\n";} bot->sendMessage(chat,msg);
+  unsigned long now = time(nullptr);
+  String msg = "Список карт:\n";
+  for(int i=0;i<cardCount;i++){
+    msg += String(cards[i].number)+". "+cards[i].name+" ("+cards[i].uid+")\n";
+    if(cards[i].isTemp){
+      if(cards[i].expire>now){
+        unsigned long rem = cards[i].expire-now;
+        unsigned long h = rem/3600; unsigned long d = rem/(24*3600);
+        if(d>0) msg += "  осталось: " + String(d) + " д.";
+        else msg += "  осталось: " + String(h) + " ч.";
+      }else msg += "  срок истёк";
+    }else msg += "  постоянная";
+    msg += "\n";
+  }
+  bot->sendMessage(chat, msg);
 }
 void handleTelegram(){
   static unsigned long lastPoll=0; if(millis()-lastPoll<1200) return; lastPoll=millis();
@@ -160,11 +205,38 @@ void handleTelegram(){
   for(int i=0;i<n;i++){
     String chat=bot->messages[i].chat_id;
     String text=bot->messages[i].text;
+    // этап ввода имени и срока действия при добавлении карты
+    if(addCardMode && chat==getAdmin()){
+      if(pendingUID.length()>0 && pendingName==""){
+        pendingName=text;
+        bot->sendMessage(chat,
+          "Выберите срок действия:",
+          "[[\"6 часов\",\"12 часов\",\"24 часа\"],[\"3 дня\",\"7 дней\",\"Постоянная\"]]"
+        );
+        continue;
+      }else if(pendingUID.length()>0 && pendingName!=""){
+        unsigned long now=time(nullptr); unsigned long exp=0; bool temp=true;
+        if(text=="6 часов") exp=now+6*3600;
+        else if(text=="12 часов") exp=now+12*3600;
+        else if(text=="24 часа") exp=now+24*3600;
+        else if(text=="3 дня") exp=now+3*86400;
+        else if(text=="7 дней") exp=now+7*86400;
+        else if(text=="Постоянная"){ exp=0; temp=false; }
+        else { bot->sendMessage(chat,"Неверный формат срока. Повторите."); continue; }
+        int next=1; for(int j=0;j<cardCount;j++) if(cards[j].number>=next) next=cards[j].number+1;
+        if(cardCount<MAX_CARDS){
+          cards[cardCount++]={next,pendingUID,pendingName,exp,temp};
+          saveCards(); sendCards();
+          bot->sendMessage(chat,"Карта добавлена! UID: "+pendingUID);
+        } else bot->sendMessage(chat,"Лимит карт заполнен");
+        addCardMode=false; pendingUID=""; pendingName="";
+        continue;
+      }
+    }
     if(text=="/open" || text=="Открыть ворота"){ openGate(); bot->sendMessage(chat,"Ворота открыты"); }
     else if(text=="/cardlist" || text=="Список карт"){ sendCardList(chat); }
-    else if(text.startsWith("Добавитькарту")){ /* not implemented */ }
     else if(text.startsWith("Удалитькарту-")){ int num=text.substring(text.indexOf('-')+1).toInt(); for(int j=0;j<cardCount;j++) if(cards[j].number==num){ for(int k=j;k<cardCount-1;k++) cards[k]=cards[k+1]; cardCount--; saveCards(); sendCards(); bot->sendMessage(chat,"Карта удалена"); break; } }
-    else if(text=="/addcard" || text=="Добавить карту"){ String uid=requestCard(); if(uid.length()){ int next=1; for(int j=0;j<cardCount;j++) if(cards[j].number>=next) next=cards[j].number+1; cards[cardCount++]={next,uid,"Без имени"}; saveCards(); sendCards(); bot->sendMessage(chat,"Карта добавлена UID: "+uid); } else bot->sendMessage(chat,"Не удалось считать карту"); }
+    else if(text=="/addcard" || text=="Добавить карту"){ addCardMode=true; pendingUID=requestCard(); if(pendingUID.length()){ bot->sendMessage(chat,"Карта считана. UID: `"+pendingUID+"`\nВведите имя владельца:","Markdown"); } else { bot->sendMessage(chat,"Не удалось считать карту"); addCardMode=false; } }
     else if(text=="/status" || text=="Статус"){ bot->sendMessage(chat,"Версия "+currentVersion); }
     else bot->sendMessage(chat,"Неизвестная команда");
   }
@@ -191,5 +263,7 @@ void loop(){
   broadcastHello();
   listenHello();
   handleTelegram();
+  static unsigned long lastExp = 0;
+  if(millis()-lastExp > 60000){ lastExp = millis(); removeExpiredCards(); }
   delay(5);
 }
